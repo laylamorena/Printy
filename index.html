@@ -1,0 +1,145 @@
+const express = require('express');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const pdfParse = require('pdf-page-counter');
+const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
+const ptp = require('pdf-to-printer');
+const cors = require('cors');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.static('public'));
+
+// Asegurar que la carpeta 'uploads' exista
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir);
+}
+
+// Configuración de almacenamiento local para archivos subidos
+const upload = multer({ dest: 'uploads/' });
+
+// Configuración de Mercado Pago
+const client = new MercadoPagoConfig({
+    accessToken: 'TU_ACCESS_TOKEN_DE_MERCADO_PAGO' // Reemplaza con tu Access Token real
+});
+
+const PRECIO_POR_HOJA = 50; // Precio por hoja impresa en moneda local
+
+// 1. Endpoint para analizar el archivo subido y calcular precio
+app.post('/api/cotizar', upload.single('archivo'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'No se subió ningún archivo' });
+        }
+
+        const filePath = req.file.path;
+        const fileBuffer = fs.readFileSync(filePath);
+        
+        // Obtener la cantidad de páginas del PDF
+        const pdfData = await pdfParse(fileBuffer);
+        const numeroPaginas = pdfData.numpages;
+
+        res.json({
+            archivoId: req.file.filename,
+            nombreOriginal: req.file.originalname,
+            paginas: numeroPaginas,
+            precioPorHoja: PRECIO_POR_HOJA
+        });
+    } catch (error) {
+        console.error('Error al cotizar:', error);
+        res.status(500).json({ error: 'Error al procesar el archivo PDF' });
+    }
+});
+
+// 2. Endpoint para crear la preferencia de pago en Mercado Pago
+app.post('/api/crear-preference', async (req, res) => {
+    try {
+        const { archivoId, paginas, copias } = req.body;
+        const totalPaginas = paginas * copias;
+        const montoTotal = totalPaginas * PRECIO_POR_HOJA;
+
+        const preference = new Preference(client);
+
+        const result = await preference.create({
+            body: {
+                items: [
+                    {
+                        title: `Impresión de documento (${totalPaginas} págs total)`,
+                        unit_price: Number(montoTotal),
+                        quantity: 1,
+                        currency_id: 'ARS' // Cambiar según tu país (ARS, MXN, CLP, etc.)
+                    }
+                ],
+                metadata: {
+                    archivo_id: archivoId,
+                    copias: copias
+                },
+                back_urls: {
+                    success: 'http://localhost:3000/exito.html',
+                    failure: 'http://localhost:3000/error.html',
+                    pending: 'http://localhost:3000/pendiente.html'
+                },
+                auto_return: 'approved'
+            }
+        });
+
+        res.json({ id: result.id, init_point: result.init_point });
+    } catch (error) {
+        console.error('Error al crear preferencia:', error);
+        res.status(500).json({ error: 'Error al generar la orden de pago' });
+    }
+});
+
+// 3. Webhook para recibir notificaciones de pago de Mercado Pago
+app.post('/api/webhook', async (req, res) => {
+    try {
+        const { query } = req;
+        const topic = query.topic || query.type;
+
+        if (topic === 'payment') {
+            const paymentId = query['data.id'] || query.id;
+            
+            // Consultar el estado del pago a la API de Mercado Pago
+            const paymentClient = new Payment(client);
+            const paymentInfo = await paymentClient.get({ id: paymentId });
+
+            // Verificar si el pago fue aprobado
+            if (paymentInfo.status === 'approved') {
+                const { archivo_id, copias } = paymentInfo.metadata;
+                console.log(`Pago aprobado para el archivo: ${archivo_id}`);
+
+                // Ejecutar orden de impresión
+                imprimirArchivo(archivo_id, copias);
+            }
+        }
+
+        res.sendStatus(200);
+    } catch (error) {
+        console.error('Error en el webhook:', error);
+        res.sendStatus(500);
+    }
+});
+
+// Función para enviar el archivo a la impresora predeterminada del sistema
+function imprimirArchivo(archivoId, copias) {
+    const filePath = path.join(__dirname, 'uploads', archivoId);
+
+    const options = {
+        copies: Number(copias) || 1
+    };
+
+    ptp.print(filePath, options)
+        .then(() => {
+            console.log(`Archivo ${archivoId} impreso exitosamente (${copias} copias).`);
+        })
+        .catch((err) => {
+            console.error('Error al enviar el archivo a la impresora:', err);
+        });
+}
+
+app.listen(3000, () => {
+    console.log('Servidor ejecutándose en http://localhost:3000');
+});
